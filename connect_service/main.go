@@ -99,8 +99,6 @@ func sendServentSublist(conn net.Conn) {
 			fmt.Println("Servent couldn't connect, not adding it to the list")
 		}
 	}
-
-	fmt.Println("Exit")
 }
 
 func main() {
