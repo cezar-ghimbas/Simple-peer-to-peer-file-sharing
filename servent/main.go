@@ -1,21 +1,57 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"sp2pfs/common"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 const PING_INTERVAL = 10
+const PING_DESCRIPTOR = 0x00
+const PONG_DESCRIPTOR = 0x01
 
-var myAddress string = GetMyAddress()
+type ConcurrentServentListMap struct {
+	data map[string]struct{}
+	sync.RWMutex
+}
+
+func NewConcurrentServentListMap() *ConcurrentServentListMap {
+	var concurrentServentListMap ConcurrentServentListMap
+	concurrentServentListMap.data = make(map[string]struct{})
+
+	return &concurrentServentListMap
+}
+
+func (m *ConcurrentServentListMap) Add(key string) {
+	m.Lock()
+	defer m.Unlock()
+
+	m.data[key] = struct{}{}
+}
+
+func (m *ConcurrentServentListMap) HasKey(key string) bool {
+	m.Lock()
+	defer m.Unlock()
+
+	_, keyFound := m.data[key]
+
+	return keyFound
+}
+
+var myAddress string = GetMyAddress().String()
 
 var connections map[string]net.Conn = make(map[string]net.Conn)
+
+var messageIDCache *ConcurrentServentListMap = NewConcurrentServentListMap()
 
 type DescriptorHeader struct {
 	DescriptorID      [16]byte
@@ -25,7 +61,14 @@ type DescriptorHeader struct {
 	PayloadLength     uint32
 }
 
-func GetMyAddress() string {
+type PongMessage struct {
+	Port                    uint16
+	IPAddress               [4]byte
+	NumberOfSharedFiles     uint32
+	NumberOfKilobytesShared uint32
+}
+
+func GetMyAddress() net.IP {
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		fmt.Println("Error getting interfaces: ", err.Error())
@@ -35,7 +78,7 @@ func GetMyAddress() string {
 		addrs, err := iface.Addrs()
 		if err != nil {
 			fmt.Println("Error getting addreses from interface: ", err.Error())
-			return ""
+			return nil
 		}
 
 		for _, addr := range addrs {
@@ -55,42 +98,90 @@ func GetMyAddress() string {
 			if ip == nil {
 				continue
 			}
-			return ip.String()
+
+			return ip
 		}
 	}
 
-	return ""
+	return nil
 }
 
 func CreateDescriptorHeader(descriptorId [16]byte, payloadDescriptor, ttl, hops uint8, payloadLength uint32) []byte {
-	data, err := json.Marshal(DescriptorHeader{
+	descriptorHeader := DescriptorHeader{
 		DescriptorID:      descriptorId,
 		PayloadDescriptor: payloadDescriptor,
 		TTL:               ttl,
 		Hops:              hops,
 		PayloadLength:     payloadLength,
-	})
+	}
+
+	var descriptorHeaderBuffer bytes.Buffer
+	err := binary.Write(&descriptorHeaderBuffer, binary.LittleEndian, descriptorHeader)
+
 	if err != nil {
-		fmt.Println("Error marshalling header descriptor: ", err.Error())
+		fmt.Println("Error writing to descriptor header buffer: ", err.Error())
 		return nil
 	}
 
-	return data
+	return descriptorHeaderBuffer.Bytes()
 }
 
-func CreatePingMessage(descriptorId [16]byte) []byte {
-	descriptorData := CreateDescriptorHeader(descriptorId, 0x01, 7, 0, 0)
+func CreatePingMessage() []byte {
+	descriptorID := uuid.New()
+	descriptorData := CreateDescriptorHeader(descriptorID, PING_DESCRIPTOR, 7, 0, 0)
+
+	messageIDCache.Add(string(descriptorID[:]))
 
 	return descriptorData
 }
 
+func CreatePongMessage(ttl uint8) []byte {
+	descriptorID := uuid.New()
+	descriptorHeader := CreateDescriptorHeader(descriptorID, PONG_DESCRIPTOR, ttl, 0, 14) //payload size hardcoded
+	port, err := strconv.ParseUint(os.Getenv("SERVENT_PORT"), 10, 16)
+	if err != nil {
+		fmt.Println("Error converting port to int64: ", err.Error())
+	}
+
+	ipAddr := GetMyAddress()
+
+	pongMessage := PongMessage{
+		Port:                    uint16(port),
+		IPAddress:               [4]byte{ipAddr[3], ipAddr[2], ipAddr[1], ipAddr[0]},
+		NumberOfSharedFiles:     0,
+		NumberOfKilobytesShared: 0,
+	}
+
+	var pongMessageBuffer bytes.Buffer
+	err = binary.Write(&pongMessageBuffer, binary.LittleEndian, pongMessage)
+	if err != nil {
+		fmt.Println("Error writing to the pong message buffer: ", err.Error())
+		return nil
+	}
+
+	return append(descriptorHeader, pongMessageBuffer.Bytes()...)
+}
+
 func SendPing() {
-	uuid := uuid.New()
-	pingMessage := CreatePingMessage(uuid)
+	pingMessage := CreatePingMessage()
 
 	for _, conn := range connections {
 		conn.Write(pingMessage)
 	}
+}
+
+func SendMessageToAllConnectionsExcept(message []byte, exclusionMap map[string]struct{}) {
+	fmt.Println(myAddress, "connections: ", connections)
+	for key, conn := range connections {
+		if _, ok := exclusionMap[key]; ok == false {
+			fmt.Println(myAddress, " writing ", message, " to ", common.GetIPFromConnection(conn))
+			conn.Write(message)
+		}
+	}
+}
+
+func SendPong(conn net.Conn, ttl uint8) {
+
 }
 
 func SendPingPeriodically() {
@@ -100,35 +191,96 @@ func SendPingPeriodically() {
 	for {
 		select {
 		case <-ticker.C:
+			fmt.Println(myAddress, " - ", connections)
 			SendPing()
 		}
 	}
 }
 
-func Pong() {
-
-}
-
 func AddConnection(ip string, conn net.Conn) {
 	if _, found := connections[ip]; found == false {
+		fmt.Println(myAddress, "adding connection: ", conn.RemoteAddr())
 		connections[ip] = conn
 	} else {
 		fmt.Println(myAddress, "connection already open: ", ip)
 	}
 }
 
-func WaitForMessages() {
-	for _, conn := range connections {
-		go func(c net.Conn) {
-			for {
-				message := make([]byte, 1024)
-				_, err := c.Read(message)
-				if err != nil {
-					fmt.Println("Error receiving message from connection: ", err.Error())
-				}
-				fmt.Println(myAddress, " - received message - ", string(message))
-			}
-		}(conn)
+func AddConnectionAndStartWaitingForMessages(ip string, conn net.Conn) {
+	if _, found := connections[ip]; found == false {
+		fmt.Println(myAddress, "adding connection: ", conn.RemoteAddr())
+		connections[ip] = conn
+		go WaitForMessagesFromConnection(conn)
+	} else {
+		fmt.Println(myAddress, "connection already open: ", ip)
+	}
+}
+
+func ProcessPingMessage(conn net.Conn, descriptorHeader DescriptorHeader) {
+	msgForForwarding := new(bytes.Buffer)
+	err := binary.Write(msgForForwarding, binary.LittleEndian, descriptorHeader)
+	if err != nil {
+		fmt.Println("Error writing the message for forwarding: ", err.Error())
+	}
+
+	SendMessageToAllConnectionsExcept(
+		msgForForwarding.Bytes(), map[string]struct{}{common.GetIPFromConnection(conn): {}})
+}
+
+func ProcessPongMessage(conn net.Conn, descriptorHeader DescriptorHeader, pongMessage PongMessage) {
+	fmt.Println("Pong message received: ", pongMessage)
+}
+
+func ProcessMessage(conn net.Conn, message []byte) {
+	var descriptorHeader DescriptorHeader
+	msgBuffer := bytes.NewBuffer(message)
+	err := binary.Read(msgBuffer, binary.LittleEndian, &descriptorHeader)
+	if err != nil {
+		fmt.Println("Error reading descriptor header: ", err.Error())
+	}
+
+	descriptorID := string(descriptorHeader.DescriptorID[:])
+
+	if messageIDCache.HasKey(descriptorID) {
+		fmt.Println("Mesage already processed")
+		return
+	}
+
+	messageIDCache.Add(descriptorID)
+
+	descriptorHeader.Hops++
+	descriptorHeader.TTL--
+
+	if descriptorHeader.TTL == 0 {
+		fmt.Println("Message expired")
+		return
+	}
+
+	switch descriptorHeader.PayloadDescriptor {
+
+	case PING_DESCRIPTOR:
+		ProcessPingMessage(conn, descriptorHeader)
+
+	case PONG_DESCRIPTOR:
+		var pongMessage PongMessage
+		err = binary.Read(msgBuffer, binary.LittleEndian, &pongMessage)
+		if err != nil {
+			fmt.Println("Error reading pong message: ", err.Error())
+		}
+		ProcessPongMessage(conn, descriptorHeader, pongMessage)
+	}
+}
+
+func WaitForMessagesFromConnection(conn net.Conn) {
+	for {
+		message := make([]byte, 1024)
+		numRead, err := conn.Read(message)
+		message = message[:numRead]
+		if err != nil {
+			fmt.Println("Error receiving message from connection ", common.GetIPFromConnection(conn), ": ", err.Error())
+		}
+		fmt.Println(myAddress, " - message received: ", message, "numRead: ", numRead)
+		ProcessMessage(conn, message)
 	}
 }
 
@@ -144,7 +296,7 @@ func WaitForConnections() {
 		if err != nil {
 			fmt.Println("Error accepting new connection: ", err.Error())
 		} else {
-			AddConnection(common.GetIPFromConnection(conn), conn)
+			AddConnectionAndStartWaitingForMessages(common.GetIPFromConnection(conn), conn)
 			fmt.Println(myAddress, " - accepted connection ", conn.RemoteAddr())
 		}
 	}
@@ -188,7 +340,7 @@ func main() {
 		if err != nil {
 			fmt.Println("Error connecting to servent: ", err.Error())
 		} else {
-			AddConnection(servent.Host, conn)
+			AddConnectionAndStartWaitingForMessages(servent.Host, conn)
 			fmt.Println(myAddress, " - succesfully connected to: ", servent.Host+":"+servent.Port)
 			successfullyConnected = true
 		}
@@ -210,7 +362,6 @@ func main() {
 	}
 
 	go SendPingPeriodically()
-	go WaitForMessages()
 
 	WaitForConnections()
 }
