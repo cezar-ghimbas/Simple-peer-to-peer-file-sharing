@@ -2,6 +2,7 @@ FROM ubuntu
 
 COPY ./servent /app/servent
 COPY ./common /app/common
+COPY ./message /app/message
 
 RUN  apt-get update \
   && apt-get install -y wget \
