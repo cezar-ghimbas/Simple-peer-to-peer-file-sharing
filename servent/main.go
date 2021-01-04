@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -80,17 +79,6 @@ func PrependDataSize(data []byte) []byte {
 	prefix := make([]byte, 4) // hardcoded
 	binary.LittleEndian.PutUint32(prefix, uint32(len(data)))
 	return append(prefix, data...)
-}
-
-func CreateFileNames() []string {
-	var resFileNames []string
-	rand.Seed(time.Now().UnixNano())
-	for i := 0; i < 10; i++ {
-		nr := 10 + rand.Intn(20)
-		resFileNames = append(resFileNames, fmt.Sprintf("%d", nr))
-	}
-
-	return resFileNames
 }
 
 func GetMyAddress() net.IP {
