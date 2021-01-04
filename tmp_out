@@ -1,0 +1,39 @@
+Step 1/11 : FROM ubuntu
+ ---> f643c72bc252
+Step 2/11 : COPY ./connect_service /app/connect_service
+ ---> Using cache
+ ---> bc3071e5ea3a
+Step 3/11 : COPY ./util /app/util
+ ---> Using cache
+ ---> a55d5b4fe3de
+Step 4/11 : RUN  apt-get update   && apt-get install -y wget   && rm -rf /var/lib/apt/lists/*
+ ---> Using cache
+ ---> 5f10dc9ccf7e
+Step 5/11 : RUN wget -c https://golang.org/dl/go1.15.6.linux-amd64.tar.gz
+ ---> Using cache
+ ---> 3dfb20ec8f8e
+Step 6/11 : RUN tar -C /usr/local -xvzf go1.15.6.linux-amd64.tar.gz
+ ---> Using cache
+ ---> 4d45c29033c4
+Step 7/11 : RUN rm go1.15.6.linux-amd64.tar.gz
+ ---> Using cache
+ ---> 20e44027704a
+Step 8/11 : ENV PATH "$PATH:/usr/local/go/bin"
+ ---> Using cache
+ ---> 172bbdf75717
+Step 9/11 : WORKDIR /app
+ ---> Using cache
+ ---> ec28dd46ed72
+Step 10/11 : RUN go mod init sp2pfs
+ ---> Using cache
+ ---> 4e4e2053a744
+Step 11/11 : RUN go build -o ./connect_service/connect_service ./connect_service/main.go
+ ---> Using cache
+ ---> 06a0e133385b
+
+Successfully built 06a0e133385b
+Successfully tagged sp2pfs_connect_service:latest
+Step 1/16 : FROM ubuntu
+ ---> f643c72bc252
+Step 2/16 : COPY ./servent /app/servent
+Gracefully stopping... (press Ctrl+C again to force)

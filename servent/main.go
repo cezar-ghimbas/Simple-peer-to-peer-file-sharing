@@ -123,25 +123,6 @@ func GetNumberOfKilobytes(nrOfBytes uint32) float64 {
 	return (float64(nrOfBytes) / 1024.0)
 }
 
-func /*(Servent)*/ createDescriptorHeader(descriptorId [16]byte, payloadDescriptor, ttl, hops uint8, payloadLength uint32) []byte {
-	descriptorHeader := message.DescriptorHeader{
-		DescriptorID:      descriptorId,
-		PayloadDescriptor: payloadDescriptor,
-		TTL:               ttl,
-		Hops:              hops,
-	}
-
-	var descriptorHeaderBuffer bytes.Buffer
-	err := binary.Write(&descriptorHeaderBuffer, binary.LittleEndian, descriptorHeader)
-
-	if err != nil {
-		fmt.Println("Error writing to descriptor header buffer: ", err.Error())
-		return nil
-	}
-
-	return descriptorHeaderBuffer.Bytes()
-}
-
 func (servent *Servent) write(conn net.Conn, message []byte) (int, error) {
 	numWritten, err := conn.Write(message)
 	if err != nil {
