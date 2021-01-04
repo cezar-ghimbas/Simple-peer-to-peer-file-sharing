@@ -3,102 +3,89 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/rand"
 	"net"
 	"os"
 	"strings"
-	"sync"
 
-	"sp2pfs/common"
+	"sp2pfs/util"
 )
 
 const BUFF_SIZE = 1024
 const NUM_SVTS_FOR_CONN = 2
 
-var currentServentList AddressSyncSlice
+var currentServentList util.ConcurrentSlice
 
-type AddressSyncSlice struct {
-	slice []common.Address
-	sync.RWMutex
-}
+func sendServentSublist(conn net.Conn) error {
+	randomAddressSlice := currentServentList.GetRandomValues(NUM_SVTS_FOR_CONN)
+	fmt.Println("Servent list: ", currentServentList)
+	fmt.Println("Servent list being sent ", randomAddressSlice, " to: ", conn.RemoteAddr())
 
-func (addressSyncSlice *AddressSyncSlice) Append(address common.Address) {
-	addressSyncSlice.Lock()
-	defer addressSyncSlice.Unlock()
-
-	addressSyncSlice.slice = append(addressSyncSlice.slice, address)
-}
-
-func sendCurrentServentList(conn net.Conn) {
-	currentServentList.Lock()
-	data, err := json.Marshal(currentServentList.slice)
-	if err != nil {
-		fmt.Println("Error marshaling servent list: ", err.Error())
-		return
+	var addressSliceToSend []util.Address
+	for _, address := range randomAddressSlice {
+		addressSliceToSend = append(addressSliceToSend, address.(util.Address))
 	}
 
-	numWritten, err := conn.Write(data)
-	if err != nil {
-		fmt.Println("Error sending servent list: ", err.Error())
-		return
-	}
-	if numWritten != len(data) {
-		fmt.Println("Servent list data only partially sent")
-	}
-	currentServentList.Unlock()
-}
-
-func sendServentSublist(conn net.Conn) {
-	defer conn.Close()
-
-	currentServentList.Lock()
-	currentServentListLen := len(currentServentList.slice)
-	currentServentList.Unlock()
-
-	var indexList []int
-	for i := 0; i < currentServentListLen; i++ {
-		indexList = append(indexList, i)
-	}
-
-	removeFromSlice := func(slice []int, index int) []int {
-		return append(slice[:index], slice[index+1:]...)
-	}
-
-	numAddrToSend := int(math.Min(float64(currentServentListLen), float64(NUM_SVTS_FOR_CONN)))
-	var addressSliceToSend []common.Address
-	for i := 0; i < numAddrToSend; i++ {
-		randomIndex := rand.Intn(len(indexList))
-		addressSliceToSend = append(addressSliceToSend, currentServentList.slice[randomIndex]) //No need for sync, elements are added at the end of the address slice
-		indexList = removeFromSlice(indexList, randomIndex)
-	}
 	data, err := json.Marshal(addressSliceToSend)
 
 	numWritten, err := conn.Write(data)
 	if err != nil {
-		fmt.Println("Error sending servent list: ", err.Error())
-		return
+		return err
 	}
-	if numWritten != len(data) {
+	if numWritten != len(data) { // maybe need to handle this case
 		fmt.Println("Servent list data only partially sent")
 	}
 
-	response := make([]byte, BUFF_SIZE)
-	numRead, err := conn.Read(response)
-	response = append([]byte(nil), response[:numRead]...)
+	return nil
+}
 
+func waitForPortMessage(conn net.Conn) (string, error) {
+	buffer := make([]byte, BUFF_SIZE)
+	numRead, err := conn.Read(buffer) //TODO: need to address receive for multiple messages, even though that shouldn't happen
 	if err != nil {
-		fmt.Println("Error reading response from servent: ", err.Error())
-	} else {
-		var port string
-		json.Unmarshal(response, &port)
-
-		if port != "0" {
-			currentServentList.Append(common.Address{Host: strings.Split(conn.RemoteAddr().String(), ":")[0], Port: port})
-		} else {
-			fmt.Println("Servent couldn't connect, not adding it to the list")
-		}
+		return "", err
 	}
+
+	buffer = append([]byte(nil), buffer[:numRead]...)
+
+	var port string
+	err = json.Unmarshal(buffer, &port)
+	if err != nil {
+		return "", err
+	}
+
+	return port, nil
+}
+
+func handleNewServentConnection(conn net.Conn) {
+	err := sendServentSublist(conn)
+	if err != nil {
+		fmt.Println("Error sending servent list: ", err.Error())
+		return
+	}
+
+	port, err := waitForPortMessage(conn)
+	if err != nil {
+		fmt.Println("Error receiving port from servent: ", err.Error())
+		return
+	}
+	if port == "0" {
+		fmt.Println("Error - servent couldn't connect, not adding it to the list")
+		return
+	}
+
+	servent := util.Address{Host: strings.Split(conn.RemoteAddr().String(), ":")[0], Port: port}
+	fmt.Println("Servent - ", servent, " port: ", port)
+
+	currentServentList.Append(servent)
+
+	//wait for servent to close and remove from the list
+	buffer := make([]byte, 1)
+	_, err = conn.Read(buffer)
+	if err != nil {
+		fmt.Println("Removing servent from list: ", servent)
+		currentServentList.DeleteValue(servent)
+	}
+	conn.Close()
 }
 
 func main() {
@@ -117,7 +104,7 @@ func main() {
 			fmt.Println("Error accepting:", err.Error())
 			os.Exit(1)
 		}
-		go sendServentSublist(conn)
+		go handleNewServentConnection(conn)
 		fmt.Println(strings.Split(conn.RemoteAddr().String(), ":")[0])
 	}
 }

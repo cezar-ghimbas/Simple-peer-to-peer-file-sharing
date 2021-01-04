@@ -1,7 +1,7 @@
 FROM ubuntu
 
 COPY ./connect_service /app/connect_service
-COPY ./common /app/common
+COPY ./util /app/util
 
 RUN  apt-get update \
   && apt-get install -y wget \

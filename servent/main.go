@@ -1,102 +1,90 @@
-package main
+package servent
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
+	"math"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
-	"sp2pfs/common"
+	"path/filepath"
 	"sp2pfs/message"
+	"sp2pfs/util"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
 
 const PING_INTERVAL = 10
+const MIN_NR_KILOBYTES_FOR_CONN = 100000
+const MIN_NR_SHARED_FILES_FOR_CONN = 100
 
 var myAddress string = GetMyAddress().String()
-
-var connections map[string]net.Conn = make(map[string]net.Conn) // shared, writable, needs sync
 
 var sharedFileNames []string = CreateFileNames()
 
 var messageCodec message.MessageCodec = new(message.MessageCodecBasic)
 
-var concurrentMessageCache *ConcurrentMessageCache = NewConcurrentMessageCache() // shared, writable, needs sync
+//var connections map[string]net.Conn = make(map[string]net.Conn)                      // shared, writable, needs sync
+//var concurrentMessageCache *util.ConcurrentStringMap = util.NewConcurrentStringMap() // shared, writable, needs sync
 
-type Pair struct {
-	values [2]interface{}
+type Servent struct {
+	//connections            map[string]net.Conn       //= make(map[string]net.Conn) // shared, writable, needs sync
+	connections            *util.ConcurrentStringMap
+	concurrentMessageCache *util.ConcurrentStringMap //= util.NewConcurrentStringMap() // shared, writable, needs sync
+	concurrentFileCache    *util.ConcurrentStringMap
+	connectServiceAddress  string
+	sharedFilesPath        string
+	queryResponseHandler   func(message.QueryHitMessage)
+	downloadServerRouter   *gin.Engine
 }
 
-func CreatePair(value1, value2 interface{}) Pair {
-	return Pair{values: [2]interface{}{value1, value2}}
+func NewServent(connectServiceAddress, sharedFilesPath string) *Servent {
+	var servent Servent
+
+	//servent.connections = make(map[string]net.Conn)
+	servent.connections = util.NewConcurrentStringMap()
+	servent.concurrentMessageCache = util.NewConcurrentStringMap()
+	servent.concurrentFileCache = util.NewConcurrentStringMap()
+	servent.connectServiceAddress = connectServiceAddress
+	servent.sharedFilesPath = sharedFilesPath
+	servent.queryResponseHandler = nil
+	servent.downloadServerRouter = gin.Default()
+	gin.SetMode(gin.ReleaseMode)
+
+	return &servent
 }
 
-type ConcurrentMessageCache struct {
-	data map[string]Pair
-	sync.RWMutex
-}
+func getConnection(concurrentMessageCache *util.ConcurrentStringMap, key string) net.Conn { //should also return error
 
-func NewConcurrentMessageCache() *ConcurrentMessageCache {
-	var concurrentMessageCache ConcurrentMessageCache
-	concurrentMessageCache.data = make(map[string]Pair)
-
-	return &concurrentMessageCache
-}
-
-func (m *ConcurrentMessageCache) Add(key string, value Pair) {
-	m.Lock()
-	defer m.Unlock()
-
-	m.data[key] = value
-}
-
-func (m *ConcurrentMessageCache) AddUnique(key string, value Pair) bool {
-	m.Lock()
-	defer m.Unlock()
-
-	_, keyFound := m.data[key]
-	if keyFound == false {
-		m.data[key] = value
-	}
-
-	return keyFound
-}
-
-func (m *ConcurrentMessageCache) HasKey(key string) bool {
-	m.Lock()
-	defer m.Unlock()
-
-	_, keyFound := m.data[key]
-
-	return keyFound
-}
-
-func GetConnection(concurrentMessageCache *ConcurrentMessageCache, key string) net.Conn {
-	concurrentMessageCache.Lock() //Is it necessary?
-	defer concurrentMessageCache.Unlock()
-
-	if concurrentMessageCache.data[key].values[0] == nil {
+	value, keyFound := concurrentMessageCache.Get(key)
+	valuePair := value.(util.Pair)
+	if !keyFound || valuePair.Values[0] == nil {
 		return nil
 	}
-	return concurrentMessageCache.data[key].values[0].(net.Conn)
+
+	return valuePair.Values[0].(net.Conn)
 }
 
-func GetDescriptorHeader(concurrentMessageCache *ConcurrentMessageCache, key string) message.DescriptorHeader {
-	concurrentMessageCache.Lock() // Is it necessary?
-	concurrentMessageCache.Unlock()
+func getDescriptorHeader(concurrentMessageCache *util.ConcurrentStringMap, key string) message.DescriptorHeader { //should also return error
+	value, _ := concurrentMessageCache.Get(key)
+	valuePair := value.(util.Pair)
 
-	return concurrentMessageCache.data[key].values[1].(message.DescriptorHeader)
+	return valuePair.Values[1].(message.DescriptorHeader) //what if the conversion fails
 }
 
 func PrependDataSize(data []byte) []byte {
-	prefix := make([]byte, 4) //////////////////////// hardcoded
+	prefix := make([]byte, 4) // hardcoded
 	binary.LittleEndian.PutUint32(prefix, uint32(len(data)))
 	return append(prefix, data...)
 }
@@ -150,7 +138,11 @@ func GetMyAddress() net.IP {
 	return nil
 }
 
-func CreateDescriptorHeader(descriptorId [16]byte, payloadDescriptor, ttl, hops uint8, payloadLength uint32) []byte {
+func GetNumberOfKilobytes(nrOfBytes uint32) float64 {
+	return (float64(nrOfBytes) / 1024.0)
+}
+
+func /*(Servent)*/ createDescriptorHeader(descriptorId [16]byte, payloadDescriptor, ttl, hops uint8, payloadLength uint32) []byte {
 	descriptorHeader := message.DescriptorHeader{
 		DescriptorID:      descriptorId,
 		PayloadDescriptor: payloadDescriptor,
@@ -169,7 +161,27 @@ func CreateDescriptorHeader(descriptorId [16]byte, payloadDescriptor, ttl, hops 
 	return descriptorHeaderBuffer.Bytes()
 }
 
-func CreatePingMessage() []byte {
+func (servent *Servent) write(conn net.Conn, message []byte) (int, error) {
+	numWritten, err := conn.Write(message)
+	if err != nil {
+		servent.connections.Delete(util.GetIPFromConnection(conn))
+		fmt.Println(myAddress, "- my connections: ", servent.connections)
+		return numWritten, err // or 0, err?
+	}
+	return numWritten, nil
+}
+
+func (servent *Servent) read(conn net.Conn, buffer []byte) (int, error) {
+	numRead, err := conn.Read(buffer)
+	if err != nil {
+		servent.connections.Delete(util.GetIPFromConnection(conn))
+		fmt.Println(myAddress, "- my connections: ", servent.connections)
+		return numRead, err // or 0, err?
+	}
+	return numRead, nil
+}
+
+func (servent *Servent) createPingMessage() ([]byte, error) {
 	descriptorID := uuid.New()
 
 	descriptorHeader := message.DescriptorHeader{
@@ -182,22 +194,27 @@ func CreatePingMessage() []byte {
 	pingMessageData, err := messageCodec.EncodePingMessage(descriptorHeader)
 
 	if err != nil {
-		fmt.Println("Error encoding ping message: ", err.Error())
-		return nil
+		return nil, err
 	}
 
-	concurrentMessageCache.Add(string(descriptorID[:]), CreatePair(nil, descriptorHeader)) // synchronization?
+	servent.concurrentMessageCache.Set(string(descriptorID[:]), util.CreatePair(nil, descriptorHeader)) // synchronization?
 
-	return pingMessageData
+	return pingMessageData, nil
 }
 
-func CreatePongMessage(descriptorID [16]byte, ttl uint8) []byte {
+func (servent *Servent) createPongMessage(descriptorID [16]byte, ttl uint8) ([]byte, error) {
 	port, err := strconv.ParseUint(os.Getenv("SERVENT_PORT"), 10, 16)
 	if err != nil {
-		fmt.Println("Error converting port to int64: ", err.Error())
+		return nil, err
 	}
 
 	ipAddr := GetMyAddress()
+
+	numberOfSharedFiles := servent.concurrentFileCache.Len()
+	var numberOfKilobytes float64 = 0.0
+	servent.concurrentFileCache.ApplyOperation(func(path interface{}, size interface{}) {
+		numberOfKilobytes += GetNumberOfKilobytes(size.(uint32))
+	})
 
 	pongMessageData, err := messageCodec.EncodePongMessage(
 		message.DescriptorHeader{
@@ -209,20 +226,19 @@ func CreatePongMessage(descriptorID [16]byte, ttl uint8) []byte {
 		message.PongMessage{
 			Port:                    uint16(port),
 			IPAddress:               [4]byte{ipAddr[0], ipAddr[1], ipAddr[2], ipAddr[3]},
-			NumberOfSharedFiles:     0,
-			NumberOfKilobytesShared: 0,
+			NumberOfSharedFiles:     uint32(numberOfSharedFiles),
+			NumberOfKilobytesShared: uint32(math.Ceil(numberOfKilobytes)), //can this conversion fail?
 		},
 	)
 
 	if err != nil {
-		fmt.Println("Error encoding pong message: ", err.Error())
-		return nil
+		return nil, err
 	}
 
-	return pongMessageData
+	return pongMessageData, nil
 }
 
-func CreateQueryMessage(minimumSpeed uint16, searchCriteria string) []byte {
+func (servent *Servent) createQueryMessage(minimumSpeed uint16, searchCriteria string) ([]byte, error) {
 	descriptorID := uuid.New()
 
 	descriptorHeader := message.DescriptorHeader{
@@ -240,24 +256,22 @@ func CreateQueryMessage(minimumSpeed uint16, searchCriteria string) []byte {
 		},
 	)
 	if err != nil {
-		fmt.Println("Error encoding query message: ", err.Error())
+		return nil, err
 	}
 
-	concurrentMessageCache.Add(string(descriptorID[:]), CreatePair(nil, descriptorHeader)) // synchronization?
+	servent.concurrentMessageCache.Set(string(descriptorID[:]), util.CreatePair(nil, descriptorHeader)) // synchronization?
 
-	return queryMessageData
+	return queryMessageData, nil
 }
 
-func CreateQueryHitMessage(descriptorID [16]byte, ttl uint8, resultSet []message.QueryResult) []byte {
-	port, err := strconv.ParseUint(os.Getenv("SERVENT_PORT"), 10, 16)
+func (servent *Servent) createQueryHitMessage(descriptorID [16]byte, ttl uint8, resultSet []message.QueryResult) ([]byte, error) {
+	port, err := strconv.ParseUint(os.Getenv("SERVENT_DOWNLOAD_PORT"), 10, 16)
 	if err != nil {
-		fmt.Println("Error converting port to int64: ", err.Error())
+		return nil, err
 	}
 
 	numberOfHits := uint8(len(resultSet))
 	ipAddr := GetMyAddress()
-
-	fmt.Println(myAddress, " - data for query hit message creation: ", ttl, resultSet)
 
 	queryHitMessageData, err := messageCodec.EncodeQueryHitMessage(
 		message.DescriptorHeader{
@@ -276,210 +290,222 @@ func CreateQueryHitMessage(descriptorID [16]byte, ttl uint8, resultSet []message
 	)
 
 	if err != nil {
-		fmt.Println(myAddress, " - error encoding query hit message: ", err.Error())
-		return nil
+		return nil, err
 	}
 
-	return queryHitMessageData
+	return queryHitMessageData, nil
 }
 
-func SendNewPingMessage() {
-	pingMessage := CreatePingMessage()
-
-	for _, conn := range connections {
-		conn.Write(PrependDataSize(pingMessage))
+func (servent *Servent) sendNewPingMessage() error {
+	pingMessage, err := servent.createPingMessage()
+	if err != nil {
+		return err
 	}
+
+	servent.connections.ApplyOperation(func(_ interface{}, conn interface{}) {
+		servent.write(conn.(net.Conn), PrependDataSize(pingMessage))
+	})
+
+	return nil
 }
 
-func SendMessageToAllConnectionsExcept(message []byte, exclusionMap map[string]struct{}) {
-	fmt.Println(myAddress, "connections: ", connections)
-	for key, conn := range connections {
-		if _, ok := exclusionMap[key]; ok == false {
-			fmt.Println(myAddress, " writing ", message, " to ", common.GetIPFromConnection(conn))
-			conn.Write(PrependDataSize(message))
+func (servent *Servent) sendMessageToAllConnectionsExcept(message []byte, exclusionMap map[string]struct{}) {
+	servent.connections.ApplyOperation(func(ipAddress interface{}, conn interface{}) {
+		if _, ok := exclusionMap[ipAddress.(string)]; ok == false {
+			servent.write(conn.(net.Conn), PrependDataSize(message))
 		}
+	})
+}
+
+func (servent *Servent) sendNewPongMessage(conn net.Conn, descriptorID [16]byte, ttl uint8) error {
+	pongMessage, err := servent.createPongMessage(descriptorID, ttl)
+	if err != nil {
+		return err
 	}
+
+	servent.write(conn, PrependDataSize(pongMessage))
+
+	return nil
 }
 
-func SendNewPongMessage(conn net.Conn, descriptorID [16]byte, ttl uint8) {
-	pongMessage := CreatePongMessage(descriptorID, ttl)
-	conn.Write(PrependDataSize(pongMessage))
-}
-
-func SendPingPeriodically() {
+func (servent *Servent) sendPingPeriodically() {
 	ticker := time.NewTicker(PING_INTERVAL * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			fmt.Println(myAddress, " - ", connections)
-			SendNewPingMessage()
+			servent.sendNewPingMessage()
 		}
 	}
 }
 
-func SendNewQueryMessage(minimumSpeed uint16, searchCriteria string) {
-	queryMessageData := CreateQueryMessage(minimumSpeed, searchCriteria)
+func (servent *Servent) sendNewQueryMessage(minimumSpeed uint16, searchCriteria string) error {
+	queryMessageData, err := servent.createQueryMessage(minimumSpeed, searchCriteria)
+	if err != nil {
+		return err
+	}
 
-	for _, conn := range connections {
-		conn.Write(PrependDataSize(queryMessageData))
+	servent.connections.ApplyOperation(func(_ interface{}, conn interface{}) {
+		servent.write(conn.(net.Conn), PrependDataSize(queryMessageData))
+	})
+
+	return nil
+}
+
+func (servent *Servent) sendNewQueryHitMessage(conn net.Conn, descriptorID [16]byte, ttl uint8, resultSet []message.QueryResult) error {
+	queryHitMessage, err := servent.createQueryHitMessage(descriptorID, ttl, resultSet)
+	if err != nil {
+		return err
+	}
+
+	servent.write(conn, PrependDataSize(queryHitMessage))
+
+	return nil
+}
+
+func (servent *Servent) addConnectionAndStartWaitingForMessages(ip string, conn net.Conn) {
+	if connectionFound := servent.connections.AddUnique(ip, conn); !connectionFound {
+		go servent.waitForMessagesFromConnection(conn)
 	}
 }
 
-func SendNewQueryHitMessage(conn net.Conn, descriptorID [16]byte, ttl uint8, resultSet []message.QueryResult) {
-	queryHitMessage := CreateQueryHitMessage(descriptorID, ttl, resultSet)
-
-	conn.Write(PrependDataSize(queryHitMessage))
-}
-
-func AddConnection(ip string, conn net.Conn) {
-	if _, found := connections[ip]; found == false {
-		fmt.Println(myAddress, "adding connection: ", conn.RemoteAddr())
-		connections[ip] = conn //synchronize???
-	} else {
-		fmt.Println(myAddress, "connection already open: ", ip)
-	}
-}
-
-func AddConnectionAndStartWaitingForMessages(ip string, conn net.Conn) {
-	if _, found := connections[ip]; found == false {
-		fmt.Println(myAddress, "adding connection: ", conn.RemoteAddr())
-		connections[ip] = conn //synchronize???
-		go WaitForMessagesFromConnection(conn)
-	} else {
-		fmt.Println(myAddress, "connection already open: ", ip)
-	}
-}
-
-func ProcessPingMessage(conn net.Conn, descriptorHeader message.DescriptorHeader) {
-	if descriptorHeader.TTL == 0 {
-		fmt.Println(myAddress, " - ping message expired")
-		return
+func (servent *Servent) processPingMessage(conn net.Conn, descriptorHeader message.DescriptorHeader) error {
+	if descriptorHeader.TTL == 0 { //ping message expired
+		return nil
 	}
 
 	descriptorID := string(descriptorHeader.DescriptorID[:])
-	messageFound := concurrentMessageCache.AddUnique(descriptorID, CreatePair(conn, descriptorHeader))
+	messageFound := servent.concurrentMessageCache.AddUnique(descriptorID, util.CreatePair(conn, descriptorHeader))
 
 	if messageFound &&
-		GetDescriptorHeader(concurrentMessageCache, descriptorID).PayloadDescriptor == message.PING_DESCRIPTOR {
-		fmt.Println(myAddress, " - ping mesage already processed")
-		return
+		getDescriptorHeader(servent.concurrentMessageCache, descriptorID).PayloadDescriptor == message.PING_DESCRIPTOR { //ping mesage already processed
+		return nil
 	}
 
 	msgForForwarding, err := messageCodec.EncodePingMessage(descriptorHeader)
 	if err != nil {
-		fmt.Println(myAddress, " - error writing the message for forwarding: ", err.Error())
+		return err
 	}
 
-	SendMessageToAllConnectionsExcept(
-		msgForForwarding, map[string]struct{}{common.GetIPFromConnection(conn): {}})
+	servent.sendMessageToAllConnectionsExcept(
+		msgForForwarding, map[string]struct{}{util.GetIPFromConnection(conn): {}})
 
-	SendNewPongMessage(conn, descriptorHeader.DescriptorID, descriptorHeader.Hops)
+	err = servent.sendNewPongMessage(conn, descriptorHeader.DescriptorID, descriptorHeader.Hops)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func ProcessPongMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, pongMessage message.PongMessage) {
+func (servent *Servent) processPongMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, pongMessage message.PongMessage) error {
 	descriptorID := string(descriptorHeader.DescriptorID[:])
-	if !concurrentMessageCache.HasKey(descriptorID) {
-		fmt.Println(myAddress, " - didn't receive any ping message with this descriptor ID, discarding message")
-		return
+	if !servent.concurrentMessageCache.HasKey(descriptorID) { //didn't receive any ping message with this descriptor ID, discarding message
+		return nil
 	}
 
-	if descriptorHeader.TTL == 0 {
-		fmt.Println(myAddress, " - pong ttl zero - ", GetConnection(concurrentMessageCache, descriptorID) == nil)
+	if descriptorHeader.TTL == 0 { //pong ttl zero, should be at original ping sender
 		//use the new connection from the pong message
+		if pongMessage.NumberOfKilobytesShared > MIN_NR_KILOBYTES_FOR_CONN ||
+			pongMessage.NumberOfSharedFiles > MIN_NR_SHARED_FILES_FOR_CONN {
+			ipAddress := util.ConvertBytesToIpAddress(pongMessage.IPAddress)
+			if !servent.connections.HasKey(ipAddress) { //trying to connect to servent from pong message
+				conn, err := net.Dial("tcp", ipAddress+":"+strconv.FormatUint(uint64(pongMessage.Port), 10))
+				if err != nil {
+					//TODO(?): maybe handle this case in some way
+				} else { //connected to the servent from the pong message
+					servent.addConnectionAndStartWaitingForMessages(ipAddress, conn)
+				}
+			}
+		}
 
-		return
+		return nil
 	}
 
 	msgForBackPropagating, err := messageCodec.EncodePongMessage(
 		descriptorHeader,
 		pongMessage,
 	)
-	if err != nil {
-		fmt.Println(myAddress, " - error writing the body of the backpropagated pong message: ", err.Error())
-		return
+	if err != nil { //error encoding the backpropagated pong message
+		return err
 	}
 
-	fmt.Println(myAddress, " - backpropagating: ", msgForBackPropagating)
-	connToSend := GetConnection(concurrentMessageCache, descriptorID)
-	connToSend.Write(PrependDataSize(msgForBackPropagating))
+	connToSend := getConnection(servent.concurrentMessageCache, descriptorID)
+	servent.write(connToSend, PrependDataSize(msgForBackPropagating))
+
+	return nil
 }
 
-func ProcessQueryMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, queryMessage message.QueryMessage) {
-	if descriptorHeader.TTL == 0 {
-		fmt.Println(myAddress, " - query message expired")
-		return
+func (servent *Servent) processQueryMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, queryMessage message.QueryMessage) error {
+
+	if descriptorHeader.TTL == 0 { //query message expired
+		return nil
 	}
 
 	descriptorID := string(descriptorHeader.DescriptorID[:])
-	messageFound := concurrentMessageCache.AddUnique(descriptorID, CreatePair(conn, descriptorHeader))
+	messageFound := servent.concurrentMessageCache.AddUnique(descriptorID, util.CreatePair(conn, descriptorHeader))
 
 	if messageFound &&
-		GetDescriptorHeader(concurrentMessageCache, descriptorID).PayloadDescriptor == message.QUERY_DESCRIPTOR {
-		fmt.Println(myAddress, " - query mesage already processed")
-		return
+		getDescriptorHeader(servent.concurrentMessageCache, descriptorID).PayloadDescriptor == message.QUERY_DESCRIPTOR { //query mesage already processed
+		return nil
 	}
 
 	msgForForwarding, err := messageCodec.EncodeQueryMessage(
 		descriptorHeader,
 		queryMessage,
 	)
-	if err != nil {
-		fmt.Println(myAddress, " - error encoding the query message for forwarding: ", err.Error())
+	if err != nil { //error encoding the query message for forwarding
+		return err
 	}
 
-	SendMessageToAllConnectionsExcept(
-		msgForForwarding, map[string]struct{}{common.GetIPFromConnection(conn): {}})
+	servent.sendMessageToAllConnectionsExcept(
+		msgForForwarding, map[string]struct{}{util.GetIPFromConnection(conn): {}})
 
-	searchCriteria := fmt.Sprintf("%s", queryMessage.SearchCriteria)
 	var resultSet []message.QueryResult
-	//use query message to find files
-	for _, fileName := range sharedFileNames {
-		if strings.Contains(fileName, searchCriteria) {
-			resultSet = append(resultSet,
-				message.QueryResult{FileSize: 0, FileName: fileName})
+	servent.concurrentFileCache.ApplyOperation(func(path interface{}, size interface{}) {
+		if strings.Contains(path.(string), queryMessage.SearchCriteria) {
+			resultSet = append(resultSet, message.QueryResult{FileSize: size.(uint32), FileName: path.(string)})
 		}
-	}
+	})
 
 	if len(resultSet) > 0 {
-		SendNewQueryHitMessage(conn, descriptorHeader.DescriptorID, descriptorHeader.Hops, resultSet)
+		servent.sendNewQueryHitMessage(conn, descriptorHeader.DescriptorID, descriptorHeader.Hops, resultSet)
 	}
+
+	return nil
 }
 
-func ProcessQueryHitMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, queryHitMessage message.QueryHitMessage) {
+func (servent *Servent) processQueryHitMessage(conn net.Conn, descriptorHeader message.DescriptorHeader, queryHitMessage message.QueryHitMessage) error {
 	descriptorID := string(descriptorHeader.DescriptorID[:])
-	if !concurrentMessageCache.HasKey(descriptorID) {
-		fmt.Println(myAddress, " - didn't receive any query message with this descriptor ID, discarding message")
-		return
+	if !servent.concurrentMessageCache.HasKey(descriptorID) { //didn't receive any query message with this descriptor ID, discarding message
+		return nil
 	}
 
-	if descriptorHeader.TTL == 0 {
-		fmt.Println(myAddress, " - query hit ttl zero - ", GetConnection(concurrentMessageCache, descriptorID) == nil)
-		//use the new connection from the pong message
-
-		return
+	if descriptorHeader.TTL == 0 { //query hit ttl zero, should be at original sender of query
+		servent.queryResponseHandler(queryHitMessage)
+		return nil
 	}
 
 	msgForBackPropagating, err := messageCodec.EncodeQueryHitMessage(
 		descriptorHeader,
 		queryHitMessage,
 	)
-	if err != nil {
-		fmt.Println(myAddress, " - error encoding the backpropagated query hit message: ", err.Error())
-		return
+	if err != nil { //error encoding the backpropagated query hit message
+		return err
 	}
 
-	fmt.Println(myAddress, " - backpropagating: ", msgForBackPropagating)
-	connToSend := GetConnection(concurrentMessageCache, descriptorID)
-	connToSend.Write(PrependDataSize(msgForBackPropagating))
+	connToSend := getConnection(servent.concurrentMessageCache, descriptorID)
+	servent.write(connToSend, PrependDataSize(msgForBackPropagating))
+
+	return nil
 }
 
-func ProcessMessage(conn net.Conn, msg []byte) {
+func (servent *Servent) processMessage(conn net.Conn, msg []byte) error {
 	msgBuffer := bytes.NewBuffer(msg)
 	descriptorHeader, err := messageCodec.DecodeDescriptorHeader(msgBuffer)
-	if err != nil {
-		fmt.Println(myAddress, " - error reading descriptor header: ", err.Error())
+	if err != nil { //error reading descriptor header
+		return err
 	}
 
 	descriptorHeader.Hops++
@@ -488,46 +514,59 @@ func ProcessMessage(conn net.Conn, msg []byte) {
 	switch descriptorHeader.PayloadDescriptor {
 
 	case message.PING_DESCRIPTOR:
-		fmt.Println(myAddress, " - ping message received: ", descriptorHeader)
-		ProcessPingMessage(conn, descriptorHeader)
+		err = servent.processPingMessage(conn, descriptorHeader)
+		if err != nil {
+			return err
+		}
 
 	case message.PONG_DESCRIPTOR:
 		pongMessage, err := messageCodec.DecodePongMessage(msgBuffer)
 		if err != nil {
-			fmt.Println(myAddress, "- error reading pong message: ", err.Error())
+			return err
 		}
-		fmt.Println(myAddress, " - pong message received: ", pongMessage)
-		ProcessPongMessage(conn, descriptorHeader, pongMessage)
+
+		err = servent.processPongMessage(conn, descriptorHeader, pongMessage)
+		if err != nil {
+			return err
+		}
 
 	case message.QUERY_DESCRIPTOR:
 		queryMessage, err := messageCodec.DecodeQueryMessage(msgBuffer)
 		if err != nil {
-			fmt.Println(myAddress, "- error reading query message: ", err.Error())
+			return err
 		}
-		fmt.Println(myAddress, "- query message received: ", queryMessage, ", search criteria size: ", len(queryMessage.SearchCriteria))
-		ProcessQueryMessage(conn, descriptorHeader, queryMessage)
+
+		err = servent.processQueryMessage(conn, descriptorHeader, queryMessage)
+		if err != nil {
+			return err
+		}
+
 	case message.QUERY_HIT_DESCRIPTOR:
 		queryHitMessage, err := messageCodec.DecodeQueryHitMessage(msgBuffer)
 		if err != nil {
-			fmt.Println(myAddress, " - error reading query hit message: ", err.Error())
+			return err
 		}
-		fmt.Println(myAddress, " - query hit message received: ", queryHitMessage)
-		ProcessQueryHitMessage(conn, descriptorHeader, queryHitMessage)
+
+		err = servent.processQueryHitMessage(conn, descriptorHeader, queryHitMessage)
+		if err != nil {
+			return err
+		}
 	}
 
+	return nil
 }
 
-func WaitForMessagesFromConnection(conn net.Conn) {
+func (servent *Servent) waitForMessagesFromConnection(conn net.Conn) {
 	var buffer []byte
 	needPrefixLength := true
 	var requiredBufferLen uint32 = 4 // hardcoded
 	for {
 		newMessage := make([]byte, 1024) //hardcoded size
-		numRead, err := conn.Read(newMessage)
-		fmt.Println(myAddress, " - message received: ", newMessage[:numRead], " from - ", common.GetIPFromConnection(conn), "numRead: ", numRead)
+		numRead, err := servent.read(conn, newMessage)
 
 		if err != nil {
-			fmt.Println("Error receiving message from connection ", common.GetIPFromConnection(conn), ": ", err.Error())
+			fmt.Println(myAddress, " - error receiving message from connection ", util.GetIPFromConnection(conn), ": ", err.Error())
+			break
 		}
 		buffer = append(buffer, newMessage[:numRead]...)
 		for {
@@ -537,7 +576,11 @@ func WaitForMessagesFromConnection(conn net.Conn) {
 					requiredBufferLen = binary.LittleEndian.Uint32(buffer)
 					needPrefixLength = false
 				} else {
-					ProcessMessage(conn, buffer[:requiredBufferLen])
+					err := servent.processMessage(conn, buffer[:requiredBufferLen])
+					if err != nil { //probably should handle differently
+						fmt.Println(myAddress, " - error processing message: ", err.Error())
+						break
+					}
 					requiredBufferLen = 4 // hardcoded
 					needPrefixLength = true
 				}
@@ -549,164 +592,94 @@ func WaitForMessagesFromConnection(conn net.Conn) {
 	}
 }
 
-func WaitForConnections() {
+func (servent *Servent) waitForConnections() {
 	listener, err := net.Listen("tcp", ":"+os.Getenv("SERVENT_PORT"))
 
 	if err != nil {
-		fmt.Println("Error creating servent listener:", err.Error())
+		fmt.Println(myAddress, " - error creating servent listener:", err.Error())
 	}
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error accepting new connection: ", err.Error())
+			fmt.Println(myAddress, " - error accepting new connection: ", err.Error())
 		} else {
-			AddConnectionAndStartWaitingForMessages(common.GetIPFromConnection(conn), conn)
+			servent.addConnectionAndStartWaitingForMessages(util.GetIPFromConnection(conn), conn)
 			fmt.Println(myAddress, " - accepted connection ", conn.RemoteAddr())
 		}
 	}
 }
 
-func Test1() {
-	/*tmpResultSet := []QueryResult2{
-		QueryResult2{FileSize: 30, FileName: [5]byte{'f', 'i', 'l', 'e', '1'}},
-		QueryResult2{FileSize: 50, FileName: [5]byte{'f', 'i', 'l', 'e', '2'}},
-		QueryResult2{FileSize: 90, FileName: [5]byte{'f', 'i', 'l', 'e', '3'}},
-	}
-	//resultSetSizeInBytes := GetQueryHitResultSetSizeInBytes(tmpResultSet)
-
-	//fmt.Println(resultSetSizeInBytes)
-
-	var tmpBuffer bytes.Buffer
-	binary.Write(&tmpBuffer, binary.LittleEndian, tmpResultSet)
-	fmt.Println("written result - ", tmpBuffer.Bytes())
-
-	var tmpReadResultSet QueryResult2
-	binary.Read(&tmpBuffer, binary.LittleEndian, &tmpReadResultSet)
-
-	fmt.Println("read result - ", tmpReadResultSet)*/
-}
-
-func Test2() {
-	/*tmpResultSet := []QueryResult{
-		QueryResult{FileSize: 30, FileName: []byte("file1")},
-		QueryResult{FileSize: 50, FileName: []byte("file2")},
-		QueryResult{FileSize: 90, FileName: []byte("file3")},
-	}
-	//resultSetSizeInBytes := GetQueryHitResultSetSizeInBytes(tmpResultSet)
-
-	//fmt.Println(resultSetSizeInBytes)
-
-	var tmpBuffer bytes.Buffer
-	encoder := gob.NewEncoder(&tmpBuffer)
-	decoder := gob.NewDecoder(&tmpBuffer)
-
-	encoder.Encode(tmpResultSet)
-	fmt.Println("written result - ", tmpBuffer.Bytes())
-
-	var tmpReadResultSet []QueryResult
-	decoder.Decode(&tmpReadResultSet)
-
-	fmt.Println("read result - ", tmpReadResultSet)*/
-}
-
-func Test3() {
-	tmp := "test"
-
-	var tmpBuffer bytes.Buffer
-	binary.Write(&tmpBuffer, binary.LittleEndian, &tmp)
-
-	var tmpRead string
-	binary.Read(&tmpBuffer, binary.LittleEndian, &tmpRead)
-
-	fmt.Println("read: ", tmpRead)
-}
-
-func Test4() {
-
-	var m message.MessageCodec = new(message.MessageCodecGob)
-
-	tmpResultSet := []message.QueryResult{
-		message.QueryResult{FileSize: 30, FileName: "file1"},
-		message.QueryResult{FileSize: 50, FileName: "file2"},
-		message.QueryResult{FileSize: 90, FileName: "file3"},
-	}
-
-	msg := message.QueryHitMessage{
-		NumberOfHits: 3,
-		Port:         1000,
-		IPAddress:    [4]byte{1, 2, 3, 4},
-		Speed:        10,
-		ResultSet:    tmpResultSet,
-	}
-
-	fmt.Println("        message - ", msg)
-
-	data, err := m.EncodeQueryHitMessage(message.DescriptorHeader{}, msg)
+func (servent *Servent) watchSharedFilePath() {
+	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		fmt.Println("Error encoding message")
+		fmt.Println(myAddress, " - error creating new watcher: ", err.Error())
+		return
 	}
+	defer watcher.Close()
 
-	buffer := bytes.NewBuffer(data)
-	decodedQueryHitMessage, err := m.DecodeQueryHitMessage(buffer)
+	err = filepath.Walk(servent.sharedFilesPath, func(path string, fileInfo os.FileInfo, err error) error {
+		if fileInfo.IsDir() {
+			return watcher.Add(path)
+		}
+		servent.concurrentFileCache.AddUnique(path, uint32(fileInfo.Size()))
+		return nil
+	})
 	if err != nil {
-		fmt.Println("Error decoding message")
+		fmt.Println(myAddress, " - error walking the file path: ", err.Error())
+		return
 	}
 
-	/*buffer := bytes.NewBuffer(data)
-	var decodedQueryHitMessage message.QueryHitMessage
-	err = message.Decode(buffer, &decodedQueryHitMessage)
-	if err != nil {
-		fmt.Println("Error decoding message")
-	}*/
+	for {
+		select {
+		case event := <-watcher.Events:
+			fmt.Println(myAddress, " - file event: ", event)
 
-	fmt.Println("decoded message - ", decodedQueryHitMessage)
-}
+			switch event.Op {
+			case fsnotify.Remove, fsnotify.Rename:
+				servent.concurrentFileCache.Delete(event.Name)
 
-func Test5() {
-	buffer := []byte{2, 5, 1, 7}
-	//fmt.Println(buffer[:4])
-	//fmt.Println(buffer[4:])
+			case fsnotify.Create, fsnotify.Write:
+				fileInfo, err := os.Stat(event.Name)
+				if err != nil {
+					fmt.Println(myAddress, " - error accessing file: ", err.Error())
+					return
+				}
+				if event.Op == fsnotify.Create {
+					if fileInfo.IsDir() {
+						watcher.Add(event.Name)
+					} else {
+						servent.concurrentFileCache.AddUnique(event.Name, uint32(fileInfo.Size()))
+					}
+				} else {
+					servent.concurrentFileCache.Set(event.Name, uint32(fileInfo.Size()))
+				}
+			}
 
-	fmt.Println(buffer[:len(buffer)])
-	fmt.Println(buffer[len(buffer):])
-}
-
-func TestSubSlice() {
-	f := func(s []int) {
-		s[0] = 3
-		s[1] = 10
+		case err = <-watcher.Errors:
+			fmt.Println(myAddress, " - error watching the dirs: ", err.Error())
+			return
+		}
 	}
-
-	s := []int{1, 2, 3, 4, 5}
-	f(s[1:])
-
-	f2 := func(s []int, val int) {
-		s[0] = val
-		s[1] = val
-	}
-
-	s2 := []int{10, 21, 35, 41, 53}
-
-	fmt.Println("s2 before: ", s2)
-	f2(s2[1:], 78)
-	f2(s2[3:], 19)
-
-	fmt.Println("s2 after: ", s2)
 }
 
-func main() {
-	fmt.Println(myAddress, " - my files: ", sharedFileNames)
+func (servent *Servent) startDownloadServer() {
+	servent.downloadServerRouter.GET("/file", func(c *gin.Context) {
+		path := c.Query("path")
+		c.File(path)
+	})
+	servent.downloadServerRouter.Run(":" + os.Getenv("SERVENT_DOWNLOAD_PORT"))
+}
 
-	//Test5()
-	//TestSubSlice()
+func (servent *Servent) SetQueryResponseHandler(handler func(message.QueryHitMessage)) {
+	servent.queryResponseHandler = handler
+}
 
-	//return
-
-	connectServiceConn, err := net.Dial("tcp", "connect_service:8080")
+func (servent *Servent) Start() {
+	connectServiceConn, err := net.Dial("tcp", servent.connectServiceAddress)
 
 	if err != nil {
-		fmt.Println("Error dialing connect service: ", err.Error())
+		fmt.Println(myAddress, " - error dialing connect service: ", err.Error())
 		return
 	}
 	defer connectServiceConn.Close()
@@ -716,15 +689,15 @@ func main() {
 	serventListData := make([]byte, 1024)
 	numRead, err := connectServiceConn.Read(serventListData)
 	if err != nil {
-		fmt.Println("Error reading servent list from connect service: ", err.Error())
+		fmt.Println(myAddress, " - error reading servent list from connect service: ", err.Error())
 		return
 	}
 
 	serventListData = append([]byte(nil), serventListData[:numRead]...)
-	var serventList []common.Address
+	var serventList []util.Address
 	err = json.Unmarshal(serventListData, &serventList)
 	if err != nil {
-		fmt.Println("Error unmarshalling servent list: ", err.Error())
+		fmt.Println(myAddress, " - error unmarshalling servent list: ", err.Error())
 		return
 	}
 
@@ -733,15 +706,10 @@ func main() {
 		successfullyConnected = true
 	}
 
-	fmt.Println(myAddress, " - ", serventList)
-
-	for _, servent := range serventList {
-		conn, err := net.Dial("tcp", servent.Host+":"+servent.Port)
-		if err != nil {
-			fmt.Println("Error connecting to servent: ", err.Error())
-		} else {
-			AddConnectionAndStartWaitingForMessages(servent.Host, conn)
-			fmt.Println(myAddress, " - succesfully connected to: ", servent.Host+":"+servent.Port)
+	for _, crntServent := range serventList {
+		conn, err := net.Dial("tcp", crntServent.Host+":"+crntServent.Port)
+		if err == nil {
+			servent.addConnectionAndStartWaitingForMessages(crntServent.Host, conn)
 			successfullyConnected = true
 		}
 	}
@@ -753,15 +721,46 @@ func main() {
 
 	portData, err := json.Marshal(port)
 	if err != nil {
-		fmt.Println("Error marshalling port number: ", err.Error())
+		fmt.Println(myAddress, " - error marshalling port number: ", err.Error())
 	}
 
 	_, err = connectServiceConn.Write(portData)
 	if err != nil {
-		fmt.Println("Error sending port to connect service: ", err.Error())
+		fmt.Println(myAddress, " - error sending port to connect service: ", err.Error())
 	}
 
-	go SendPingPeriodically()
+	go servent.sendPingPeriodically()
 
-	WaitForConnections()
+	go servent.startDownloadServer()
+
+	go servent.watchSharedFilePath() // maybe use watcher to not walk the file path every time
+
+	servent.waitForConnections()
+}
+
+func (servent *Servent) Query(minimumSpeed uint16, searchCriteria string) error {
+	if servent.queryResponseHandler == nil {
+		return errors.New(myAddress + " - error: query response handler not set")
+	}
+	servent.sendNewQueryMessage(minimumSpeed, searchCriteria)
+
+	return nil
+}
+
+func (servent *Servent) Download(fileToDownload, filename, ipAddress string) error {
+	queryEscapedFileToDownload := url.QueryEscape(fileToDownload)
+	url := "http://" + ipAddress + "/file?path=" + queryEscapedFileToDownload
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+
+	responseBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	ioutil.WriteFile(servent.sharedFilesPath+"/"+filename, responseBody, 0644)
+
+	return nil
 }

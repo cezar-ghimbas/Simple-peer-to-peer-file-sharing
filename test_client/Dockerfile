@@ -3,6 +3,8 @@ FROM ubuntu
 COPY ./servent /app/servent
 COPY ./util /app/util
 COPY ./message /app/message
+COPY ./test_client /app/test_client
+COPY ./file_generator /app/file_generator
 
 RUN  apt-get update \
   && apt-get install -y wget \
@@ -18,4 +20,8 @@ WORKDIR /app
 
 RUN go mod init sp2pfs
 
-RUN go build -o ./servent/servent ./servent/main.go
+RUN go build -o ./test_client/test_client ./test_client/main.go
+
+RUN go build -o ./file_generator/file_generator ./file_generator/main.go
+RUN mkdir -p /shared
+#RUN ./file_generator/file_generator /shared

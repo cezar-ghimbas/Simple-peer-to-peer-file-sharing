@@ -1,15 +1,16 @@
 version: "3.8"
 
 services:
-  servent:
+  test_client:
     build:
       context: .
-      dockerfile: ./servent/Dockerfile
-    command: ./servent/servent
+      dockerfile: ./test_client/Dockerfile
+    command: ["/bin/bash", "-c", "./file_generator/file_generator /shared && ./test_client/test_client -addr=connect_service:8080 -files=/shared"]
     depends_on:
       - connect_service
     environment:
       - SERVENT_PORT=3000
+      - SERVENT_DOWNLOAD_PORT=3001
 
   connect_service:
     build:
