@@ -8,21 +8,6 @@ import (
 type MessageCodecGob struct {
 }
 
-/*func EncodeGob(data interface{}) ([]byte, error) {
-	var buffer bytes.Buffer
-	encoder := gob.NewEncoder(&buffer)
-	err := encoder.Encode(data)
-
-	return buffer.Bytes(), err
-}
-
-func DecodeGob(buffer *bytes.Buffer, data interface{}) error {
-	decoder := gob.NewDecoder(buffer)
-	err := decoder.Decode(data)
-
-	return err
-}*/
-
 func (MessageCodecGob) EncodePingMessage(descriptorHeader DescriptorHeader) ([]byte, error) {
 	var buffer bytes.Buffer
 	encoder := gob.NewEncoder(&buffer)
