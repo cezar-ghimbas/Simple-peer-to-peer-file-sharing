@@ -31,17 +31,11 @@ const MIN_NR_SHARED_FILES_FOR_CONN = 100
 
 var myAddress string = GetMyAddress().String()
 
-var sharedFileNames []string = CreateFileNames()
-
 var messageCodec message.MessageCodec = new(message.MessageCodecBasic)
 
-//var connections map[string]net.Conn = make(map[string]net.Conn)                      // shared, writable, needs sync
-//var concurrentMessageCache *util.ConcurrentStringMap = util.NewConcurrentStringMap() // shared, writable, needs sync
-
 type Servent struct {
-	//connections            map[string]net.Conn       //= make(map[string]net.Conn) // shared, writable, needs sync
 	connections            *util.ConcurrentStringMap
-	concurrentMessageCache *util.ConcurrentStringMap //= util.NewConcurrentStringMap() // shared, writable, needs sync
+	concurrentMessageCache *util.ConcurrentStringMap
 	concurrentFileCache    *util.ConcurrentStringMap
 	connectServiceAddress  string
 	sharedFilesPath        string
@@ -52,7 +46,6 @@ type Servent struct {
 func NewServent(connectServiceAddress, sharedFilesPath string) *Servent {
 	var servent Servent
 
-	//servent.connections = make(map[string]net.Conn)
 	servent.connections = util.NewConcurrentStringMap()
 	servent.concurrentMessageCache = util.NewConcurrentStringMap()
 	servent.concurrentFileCache = util.NewConcurrentStringMap()
